@@ -1142,6 +1142,10 @@ PyObject *exclusion_match(struct libnvme_global_ctx *ctx,
 
 %pythoncode %{
 import sys
+import os
+import functools
+
+_REF_DEBUG = os.environ.get('LIBNVME_REF_DEBUG', '') not in ('', '0')
 
 from libnvme3._exceptions import (
 	NvmeError,
@@ -1526,6 +1530,13 @@ struct libnvme_host *libnvme_first_host(struct libnvme_global_ctx *ctx);
 struct libnvme_host *libnvme_next_host(struct libnvme_global_ctx *ctx, struct libnvme_host *h);
 void libnvme_host_ref_at(struct libnvme_host *h, const char *file, int line);
 void libnvme_host_unref_at(struct libnvme_host *h, const char *file, int line);
+%exception libnvme_topology_lock {
+	Py_BEGIN_ALLOW_THREADS
+	$action
+	Py_END_ALLOW_THREADS
+}
+void libnvme_topology_lock(struct libnvme_global_ctx *ctx);
+void libnvme_topology_unlock(struct libnvme_global_ctx *ctx);
 struct libnvme_subsystem *libnvme_first_subsystem(struct libnvme_host *h);
 struct libnvme_subsystem *libnvme_next_subsystem(struct libnvme_host *h, struct libnvme_subsystem *s);
 struct libnvme_ctrl *libnvme_subsystem_first_ctrl(struct libnvme_subsystem *s);
@@ -1534,6 +1545,16 @@ struct libnvme_ns *libnvme_subsystem_first_ns(struct libnvme_subsystem *s);
 struct libnvme_ns *libnvme_subsystem_next_ns(struct libnvme_subsystem *s, struct libnvme_ns *n);
 struct libnvme_ns *libnvme_ctrl_first_ns(struct libnvme_ctrl *c);
 struct libnvme_ns *libnvme_ctrl_next_ns(struct libnvme_ctrl *c, struct libnvme_ns *n);
+
+%rename(_host_ref) host_ref;
+%newobject host_ref;
+%inline %{
+struct libnvme_host *host_ref(struct libnvme_host *h, const char *file, int line)
+{
+	libnvme_host_ref_at(h, file, line);
+	return h;
+}
+%}
 
 %extend libnvme_global_ctx {
 	%feature("autodoc", "__init__(self, owner=None, hostnqn=None, hostid=None)\n"
@@ -1596,14 +1617,24 @@ struct libnvme_ns *libnvme_ctrl_next_ns(struct libnvme_ctrl *c, struct libnvme_n
 	}
 	%pythoncode %{
 	def hosts(self):
-	    """Yield each Host in this context."""
-	    h = _libnvme_first_host(self)
-	    while h:
-	        _frame = sys._getframe(1)
-	        _libnvme_host_ref_at(h, _frame.f_code.co_filename, _frame.f_lineno)
-	        h.thisown = True
-	        yield h
-	        h = _libnvme_next_host(self, h)
+	    """Yield a snapshot of referenced hosts in this context."""
+	    file, line = None, 0
+	    if _REF_DEBUG:
+	        frame = sys._getframe(1)
+	        file, line = frame.f_code.co_filename, frame.f_lineno
+	        del frame
+	    hosts = []
+	    libnvme_topology_lock(self)
+	    try:
+	        h = _libnvme_first_host(self)
+	        while h:
+	            h = _host_ref(h, file, line)
+	            h.__parent = self
+	            hosts.append(h)
+	            h = _libnvme_next_host(self, h)
+	    finally:
+	        libnvme_topology_unlock(self)
+	    yield from hosts
 	%}
 	%feature("autodoc", "Scan the NVMe topology and add what is found to "
 		"the device tree.\n"
@@ -1617,9 +1648,9 @@ struct libnvme_ns *libnvme_ctrl_next_ns(struct libnvme_ctrl *c, struct libnvme_n
 	%feature("autodoc", "Discard the device tree and scan the NVMe "
 		"topology again.\n"
 		"\n"
-		"Destructive: every host, subsystem, controller and namespace "
-		"is freed before the scan, so any object the caller still "
-		"holds becomes invalid. Use it to drop devices that have gone "
+		"Existing hosts are detached and their subsystems are cleared. "
+		"Held Host objects remain valid; subsystem, controller and "
+		"namespace objects become invalid. Use it to drop devices that have gone "
 		"away; use scan_topology() to pick up new ones.") refresh_topology;
 	void refresh_topology() {
 		libnvme_refresh_topology($self);
@@ -1644,8 +1675,12 @@ struct libnvme_ns *libnvme_ctrl_next_ns(struct libnvme_ctrl *c, struct libnvme_n
 				   const char *hostid,
 				   const char *hostkey,
 				   const char *hostsymname) {
-	_frame = sys._getframe(1)
-	_libnvme_host_ref_at(self, _frame.f_code.co_filename, _frame.f_lineno)
+	_file, _line = None, 0
+	if _REF_DEBUG:
+	    _frame = sys._getframe(2)
+	    _file, _line = _frame.f_code.co_filename, _frame.f_lineno
+	    del _frame
+	_libnvme_host_ref_at(self, _file, _line)
 	self.__parent = ctx  # Keep a reference to parent to ensure garbage collection happens in the right order}
 %extend libnvme_host {
 	%feature("autodoc", "__init__(self, ctx, hostnqn=None, hostid=None, hostkey=None, hostsymname=None)\n"
@@ -2110,6 +2145,21 @@ struct libnvme_ns *libnvme_ctrl_next_ns(struct libnvme_ctrl *c, struct libnvme_n
 	}
 }
 
+
+%pythoncode %{
+_host_init_impl = Host.__init__
+
+@functools.wraps(_host_init_impl)
+def _host_init_locked(self, ctx, *args, **kwargs):
+    # Lookup and the wrapper's ref must precede a concurrent detach.
+    libnvme_topology_lock(ctx)
+    try:
+        _host_init_impl(self, ctx, *args, **kwargs)
+    finally:
+        libnvme_topology_unlock(ctx)
+
+Host.__init__ = _host_init_locked
+%}
 
 // We want to swig all the #define and enum from nvme-types.h, but none of the structs.
 #pragma SWIG nowarn=503             // Supress warnings about unnamed struct

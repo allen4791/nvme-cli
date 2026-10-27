@@ -164,3 +164,9 @@ LIBNVME_3 {
 	local:
 		*;
 };
+
+LIBNVME_3.1 {
+	global:
+		libnvme_topology_lock;
+		libnvme_topology_unlock;
+} LIBNVME_3;

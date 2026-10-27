@@ -84,6 +84,10 @@ struct libnvme_global_ctx *libnvme_host_get_global_ctx(struct libnvme_host *h);
  *
  * Returns a host object based on the hostnqn/hostid values or the default if
  * hostnqn/hostid are NULL.
+ * The returned host is borrowed from @ctx. To keep it across a refresh or
+ * context destruction, take a reference with libnvme_host_ref(). When sharing
+ * the topology between threads, hold libnvme_topology_lock() across lookup
+ * and ref; a borrowed pointer alone does not protect against removal.
  *
  * Return: 0 on success, negative error code otherwise.
  */
@@ -892,8 +896,12 @@ int libnvme_scan_topology(struct libnvme_global_ctx *ctx,
 void libnvme_host_release_fds(struct libnvme_host *h);
 
 /**
- * libnvme_free_host() - Free struct libnvme_host object
+ * libnvme_free_host() - Remove a host from its topology
  * @h:	struct libnvme_host object
+ *
+ * Detach @h, free its subsystems, and release the tree's reference.
+ * Other owners retain an empty host and a live context until their final
+ * unref. Calling this on an already detached, referenced host does nothing.
  */
 void libnvme_free_host(struct libnvme_host *h);
 
@@ -919,6 +927,9 @@ void libnvme_host_unref_at(struct libnvme_host *h, const char *file, int line);
  *
  * Pair with libnvme_host_unref(). LIBNVME_REF_DEBUG logs each call's
  * file:line to stderr, independent of libnvme_set_logging_level().
+ * It is read once, at the first ref or unref; unset, empty and "0" disable it.
+ * The caller must already own a reference, or hold the topology lock while
+ * acquiring one from a borrowed host. This does not lock the host's fields.
  */
 #define libnvme_host_ref(h) libnvme_host_ref_at(h, __FILE__, __LINE__)
 
@@ -927,7 +938,9 @@ void libnvme_host_unref_at(struct libnvme_host *h, const char *file, int line);
  * @h:	struct libnvme_host object
  *
  * Frees @h once the count reaches zero. Must match every
- * libnvme_host_ref() and the reference from libnvme_get_host().
+ * libnvme_host_ref(). Do not release libnvme_get_host()'s borrowed pointer.
+ * This does not remove the host from the topology: use libnvme_free_host()
+ * to detach it and release the tree's reference.
  */
 #define libnvme_host_unref(h) libnvme_host_unref_at(h, __FILE__, __LINE__)
 
@@ -935,7 +948,9 @@ void libnvme_host_unref_at(struct libnvme_host *h, const char *file, int line);
  * libnvme_refresh_topology() - Refresh libnvme_root_t object contents
  * @ctx:		&struct libnvme_global_ctx object
  *
- * Removes all elements in @r and rescans the existing topology.
+ * Detaches all hosts, clears their subsystems, and rescans the topology.
+ * Referenced hosts remain valid but are no longer part of @ctx's tree.
+ * Subsystem, controller and namespace pointers are invalidated.
  *
  * Returns: 0 on success, negative error code otherwise.
  */

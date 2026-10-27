@@ -9,7 +9,10 @@ import contextlib
 import errno
 import gc
 import os
+import subprocess
+import sys
 import unittest
+from unittest import mock
 from libnvme3 import nvme
 
 
@@ -35,7 +38,6 @@ def capture_libnvme_ref_debug_log():
     it -- only an fd-level redirect does). Yields a callable that
     returns everything captured so far, without blocking.
     """
-    os.environ['LIBNVME_REF_DEBUG'] = '1'
     stderr_fd = 2
     saved_fd = os.dup(stderr_fd)
     read_fd, write_fd = os.pipe()
@@ -48,7 +50,6 @@ def capture_libnvme_ref_debug_log():
         os.dup2(saved_fd, stderr_fd)
         os.close(saved_fd)
         os.close(read_fd)
-        del os.environ['LIBNVME_REF_DEBUG']
 
 
 class TestConstants(unittest.TestCase):
@@ -366,6 +367,7 @@ class TestCtrlErrorHandling(unittest.TestCase):
         self.assertEqual(cm.exception.message, os.strerror(errno.EINVAL))
 
 
+@unittest.skipUnless(nvme._REF_DEBUG, 'requires LIBNVME_REF_DEBUG at startup')
 class TestHostRefCounting(unittest.TestCase):
     """Host objects obtained via ctx.hosts() must take/release a real
     libnvme refcount on the underlying C object (see issue #3736),
@@ -433,6 +435,115 @@ class TestHostRefCounting(unittest.TestCase):
 
         self.assertIn('unref host=', after_drop)
         self.assertIn('<gc>', after_drop)
+
+    def test_debug_setting_is_cached(self):
+        setting = os.environ.pop('LIBNVME_REF_DEBUG', None)
+        try:
+            with capture_libnvme_ref_debug_log() as drain:
+                nvme.Host(self.ctx)
+                output = drain()
+            self.assertIn('ref host=', output)
+        finally:
+            if setting is not None:
+                os.environ['LIBNVME_REF_DEBUG'] = setting
+
+
+class TestHostLifetime(unittest.TestCase):
+    NQN = 'nqn.2014-08.org.nvmexpress:uuid:11111111-2222-3333-4444-555555555555'
+
+    def test_refresh_detaches_held_host(self):
+        ctx = nvme.GlobalCtx()
+        host = nvme.Host(ctx, hostnqn=self.NQN)
+        held = list(ctx.hosts())
+        ctx.refresh_topology()
+        self.assertEqual(host.hostnqn, self.NQN)
+        self.assertEqual(held[0].hostnqn, self.NQN)
+        self.assertEqual(list(host.subsystems()), [])
+        self.assertNotIn(self.NQN, [h.hostnqn for h in ctx.hosts()])
+
+        replacement = nvme.Host(ctx, hostnqn=self.NQN)
+        del held, host
+        gc.collect()
+        self.assertIn(self.NQN, [h.hostnqn for h in ctx.hosts()])
+        self.assertEqual(replacement.hostnqn, self.NQN)
+
+    def test_iterator_survives_refresh_between_yields(self):
+        ctx = nvme.GlobalCtx()
+        nvme.Host(ctx, hostnqn=self.NQN)
+        nvme.Host(ctx, hostnqn=self.NQN + '-second')
+        iterator = ctx.hosts()
+        first = next(iterator)
+        ctx.refresh_topology()
+        second = next(iterator)
+        self.assertEqual({first.hostnqn, second.hostnqn},
+                         {self.NQN, self.NQN + '-second'})
+        with self.assertRaises(StopIteration):
+            next(iterator)
+
+    def test_iterator_host_survives_context_wrapper(self):
+        ctx = nvme.GlobalCtx()
+        nvme.Host(ctx, hostnqn=self.NQN)
+        host = list(ctx.hosts())[0]
+        del ctx
+        gc.collect()
+        self.assertEqual(host.hostnqn, self.NQN)
+        del host
+        gc.collect()
+
+    def test_repeated_iterator_wrapper_collection(self):
+        for _ in range(20):
+            ctx = nvme.GlobalCtx()
+            nvme.Host(ctx, hostnqn=self.NQN)
+            hosts = list(ctx.hosts())
+            self.assertIsInstance(hosts[0], nvme.Host)
+            del hosts, ctx
+            gc.collect()
+
+    def test_module_shutdown_with_iterator_host(self):
+        code = (
+            'from libnvme3 import nvme\n'
+            'ctx = nvme.GlobalCtx()\n'
+            f'nvme.Host(ctx, hostnqn={self.NQN!r})\n'
+            'for h in ctx.hosts():\n'
+            '    print(h.hostnqn)\n'
+        )
+        result = subprocess.run([sys.executable, '-c', code],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.NQN, result.stdout)
+        self.assertNotIn('AddressSanitizer', result.stderr)
+
+    def test_waiting_for_topology_lock_releases_gil(self):
+        code = (
+            'import threading, time\n'
+            'from libnvme3 import nvme\n'
+            'ctx = nvme.GlobalCtx()\n'
+            'entered = threading.Event()\n'
+            'def acquire_host():\n'
+            '    entered.set()\n'
+            f'    nvme.Host(ctx, hostnqn={self.NQN!r})\n'
+            'nvme.libnvme_topology_lock(ctx)\n'
+            'worker = threading.Thread(target=acquire_host)\n'
+            'worker.start()\n'
+            'assert entered.wait(2)\n'
+            'time.sleep(0.02)\n'
+            'nvme.libnvme_topology_unlock(ctx)\n'
+            'worker.join(2)\n'
+            'assert not worker.is_alive()\n'
+        )
+        result = subprocess.run([sys.executable, '-c', code],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipIf(nvme._REF_DEBUG, 'debug mode records caller frames')
+    def test_debug_disabled_does_not_inspect_frames(self):
+        ctx = nvme.GlobalCtx()
+        with mock.patch.object(sys, '_getframe', side_effect=AssertionError):
+            host = nvme.Host(ctx, hostnqn=self.NQN)
+            hosts = list(ctx.hosts())
+        self.assertEqual(hosts[0].hostnqn, host.hostnqn)
 
 
 class TestHelperFunctions(unittest.TestCase):

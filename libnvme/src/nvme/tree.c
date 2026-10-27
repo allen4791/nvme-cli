@@ -118,7 +118,7 @@ static void libnvme_filter_tree(struct libnvme_global_ctx *ctx,
 	}
 }
 
-__shr_public int libnvme_scan_topology(struct libnvme_global_ctx *ctx,
+static int libnvme_scan_topology_locked(struct libnvme_global_ctx *ctx,
 		libnvme_scan_filter_t f, void *f_args)
 {
 	__cleanup_dirents struct dirents subsys = {}, ctrls = {};
@@ -172,6 +172,20 @@ __shr_public int libnvme_scan_topology(struct libnvme_global_ctx *ctx,
 	return 0;
 }
 
+__shr_public int libnvme_scan_topology(struct libnvme_global_ctx *ctx,
+		libnvme_scan_filter_t f, void *f_args)
+{
+	int err;
+
+	if (!ctx)
+		return 0;
+	libnvme_topology_lock(ctx);
+	err = libnvme_scan_topology_locked(ctx, f, f_args);
+	libnvme_topology_unlock(ctx);
+
+	return err;
+}
+
 __shr_public void libnvme_skip_namespaces(struct libnvme_global_ctx *ctx)
 {
 	ctx->create_only = true;
@@ -209,10 +223,15 @@ __shr_public struct libnvme_subsystem *libnvme_next_subsystem(struct libnvme_hos
 __shr_public int libnvme_refresh_topology(struct libnvme_global_ctx *ctx)
 {
 	struct libnvme_host *h, *_h;
+	int err;
 
+	libnvme_topology_lock(ctx);
 	libnvme_for_each_host_safe(ctx, h, _h)
-		__libnvme_free_host(h);
-	return libnvme_scan_topology(ctx, NULL, NULL);
+		libnvme_free_host(h);
+	err = libnvme_scan_topology(ctx, NULL, NULL);
+	libnvme_topology_unlock(ctx);
+
+	return err;
 }
 
 void nvme_root_release_fds(struct libnvme_global_ctx *ctx)
@@ -329,10 +348,15 @@ __shr_public void libnvme_subsystem_release_fds(struct libnvme_subsystem *s)
  */
 __shr_public void libnvme_free_subsystem(struct libnvme_subsystem *s)
 {
+	struct libnvme_global_ctx *ctx;
+
 	if (!s)
 		return;
 
+	ctx = s->h->ctx;
+	libnvme_topology_lock(ctx);
 	__nvme_free_subsystem(s);
+	libnvme_topology_unlock(ctx);
 }
 
 int libnvme_create_subsystem(struct libnvme_host *h,
@@ -340,6 +364,9 @@ int libnvme_create_subsystem(struct libnvme_host *h,
 		struct libnvme_subsystem **ps)
 {
 	struct libnvme_subsystem *s;
+
+	if (!h->attached)
+		return -ENODEV;
 
 	s = calloc(1, sizeof(*s));
 	if (!s)
@@ -396,60 +423,77 @@ __shr_public int libnvme_get_subsystem(struct libnvme_global_ctx *ctx,
 	struct libnvme_subsystem *s;
 	int err;
 
+	libnvme_topology_lock(ctx);
+	if (!h->attached) {
+		libnvme_topology_unlock(ctx);
+		return -ENODEV;
+	}
 	s = libnvme_lookup_subsystem(h, name, subsysnqn);
 	if (s)
 		goto found;
 
 	err = libnvme_create_subsystem(h, name, subsysnqn, &s);
-	if (err)
+	if (err) {
+		libnvme_topology_unlock(ctx);
 		return err;
+	}
 
 found:
 	*subsys = s;
+	libnvme_topology_unlock(ctx);
 
 	return 0;
 }
 
-void __libnvme_free_host(struct libnvme_host *h)
+static void __libnvme_free_host(struct libnvme_host *h)
 {
-	struct libnvme_subsystem *s, *_s;
+	struct libnvme_global_ctx *ctx = h->ctx;
 
-	if (--h->refcount > 0)
-		return;
-
-	list_del_init(&h->entry);
-	libnvme_for_each_subsystem_safe(h, s, _s)
-		__nvme_free_subsystem(s);
 	free(h->hostnqn);
 	free(h->hostid);
 	free(h->kxchap_host_key);
 	libnvme_host_set_hostsymname(h, NULL);
 	free(h);
+	__libnvme_global_ctx_unref(ctx);
+}
+
+static pthread_once_t ref_debug_once = PTHREAD_ONCE_INIT;
+static bool ref_debug_enabled;
+
+static void libnvme_ref_debug_init(void)
+{
+	const char *value = getenv("LIBNVME_REF_DEBUG");
+
+	ref_debug_enabled = value && *value && strcmp(value, "0");
 }
 
 static void __libnvme_ref_debug_log(const char *obj, const char *action,
 		void *ptr, int refcount, const char *file, int line)
 {
-	if (!getenv("LIBNVME_REF_DEBUG"))
+	pthread_once(&ref_debug_once, libnvme_ref_debug_init);
+	if (!ref_debug_enabled)
 		return;
 
 	fprintf(stderr, "%s:%d %s %s=%p count=%d\n",
-		file, line, action, obj, ptr, refcount);
+		file ? file : "<unknown>", line, action, obj, ptr, refcount);
 }
 
 __shr_public void libnvme_host_ref_at(struct libnvme_host *h,
 		const char *file, int line)
 {
-	h->refcount++;
-	__libnvme_ref_debug_log("host", "ref", h, h->refcount, file, line);
+	int count = atomic_fetch_add(&h->refcount, 1) + 1;
+
+	__libnvme_ref_debug_log("host", "ref", h, count, file, line);
 }
 
 __shr_public void libnvme_host_unref_at(struct libnvme_host *h,
 		const char *file, int line)
 {
-	__libnvme_ref_debug_log("host", "unref", h, h->refcount - 1,
-			file, line);
-	__libnvme_free_host(h);
+	int count = atomic_fetch_sub(&h->refcount, 1) - 1;
+
+	__libnvme_ref_debug_log("host", "unref", h, count, file, line);
+	if (!count)
+		__libnvme_free_host(h);
 }
 
 __shr_public void libnvme_host_release_fds(struct libnvme_host *h)
@@ -463,10 +507,24 @@ __shr_public void libnvme_host_release_fds(struct libnvme_host *h)
 /* Stub for SWIG */
 __shr_public void libnvme_free_host(struct libnvme_host *h)
 {
+	struct libnvme_subsystem *s, *_s;
+	struct libnvme_global_ctx *ctx;
+
 	if (!h)
 		return;
 
-	__libnvme_free_host(h);
+	ctx = h->ctx;
+	libnvme_topology_lock(ctx);
+	if (!h->attached) {
+		libnvme_topology_unlock(ctx);
+		return;
+	}
+	list_del_init(&h->entry);
+	h->attached = false;
+	libnvme_for_each_subsystem_safe(h, s, _s)
+		__nvme_free_subsystem(s);
+	libnvme_topology_unlock(ctx);
+	libnvme_host_unref(h);
 }
 
 int libnvme_create_host(struct libnvme_global_ctx *ctx,
@@ -499,13 +557,24 @@ int libnvme_create_host(struct libnvme_global_ctx *ctx,
 
 	h->hostnqn = hnqn;
 	h->hostid = hid;
-	h->refcount = 1;
+	atomic_init(&h->refcount, 1);
 
 	list_head_init(&h->subsystems);
 	list_node_init(&h->entry);
 	h->ctx = ctx;
 
+	libnvme_topology_lock(ctx);
+	if (ctx->destroying) {
+		libnvme_topology_unlock(ctx);
+		free(h->hostnqn);
+		free(h->hostid);
+		free(h);
+		return -ENODEV;
+	}
+	__libnvme_global_ctx_ref(ctx);
+	h->attached = true;
 	list_add_tail(&ctx->hosts, &h->entry);
+	libnvme_topology_unlock(ctx);
 
 	*host = h;
 
@@ -549,12 +618,14 @@ __shr_public int libnvme_get_host(
 	if (!hostid)
 		hostid = NVME_DEFAULT_HOSTID;
 
+	libnvme_topology_lock(ctx);
 	h = libnvme_lookup_host(ctx, hostnqn, hostid);
 	if (h)
 		goto found;
 
 	err = libnvme_create_host(ctx, hostnqn, hostid, &h);
 	if (err) {
+		libnvme_topology_unlock(ctx);
 		libnvme_msg(ctx, LIBNVME_LOG_ERR,
 			"Failed to create host '%s'\n",
 			hostnqn ? hostnqn : "<unset>");
@@ -563,6 +634,7 @@ __shr_public int libnvme_get_host(
 
 found:
 	*host = h;
+	libnvme_topology_unlock(ctx);
 	return 0;
 }
 

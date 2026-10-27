@@ -106,4 +106,10 @@ if want_python
         args = test[1]
         test('libnvme - python/' + description, python3, args: args, env: test_env, depends: pynvme_clib, suite: 'unit')
     endforeach
+
+    ref_debug_env = test_env
+    ref_debug_env.set('LIBNVME_REF_DEBUG', '1')
+    test('libnvme - python/host-ref-debug', python3,
+         args: [files('tests/test-objects.py'), 'TestHostRefCounting'],
+         env: ref_debug_env, depends: pynvme_clib, suite: 'unit')
 endif

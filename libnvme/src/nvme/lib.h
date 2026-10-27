@@ -38,9 +38,29 @@ struct libnvme_global_ctx *libnvme_create_global_ctx(void);
  * libnvme_free_global_ctx() - Free global context object
  * @ctx:	&struct libnvme_global_ctx object
  *
- * Free an &struct libnvme_global_ctx object and all attached objects
+ * Remove all attached hosts and release the caller's context ownership.
+ * Referenced hosts keep the context alive until their final unref.
+ * The caller must stop other topology users before destroying the context.
  */
 void libnvme_free_global_ctx(struct libnvme_global_ctx *ctx);
+
+/**
+ * libnvme_topology_lock() - Lock a context's topology
+ * @ctx: Global context owned by the caller
+ *
+ * Serialize topology traversal and modification across threads. Hold this
+ * lock while obtaining a borrowed host and taking a reference on it.
+ * Borrowed subsystem, controller and namespace pointers also need this lock
+ * while they are in use if another thread can remove them. The lock is
+ * recursive. Do not wait for another topology user while holding the lock.
+ */
+void libnvme_topology_lock(struct libnvme_global_ctx *ctx);
+
+/**
+ * libnvme_topology_unlock() - Unlock a context's topology
+ * @ctx: Global context locked by the caller
+ */
+void libnvme_topology_unlock(struct libnvme_global_ctx *ctx);
 
 /**
  * libnvme_set_owner() - Set the orchestrator identity for the registry

@@ -169,6 +169,7 @@ else
 endif
 
 deps = [
+    threads_dep,
     ccan_dep,
     config_dep,
     keyutils_dep,

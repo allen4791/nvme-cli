@@ -8,6 +8,7 @@
 #pragma once
 
 #include <stdatomic.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <string.h>
@@ -401,6 +402,7 @@ struct libnvme_host {  // !generate-accessors:read=generated,write=none !generat
 	char *kxchap_host_key;		// !access:write=generated
 	char *hostsymname;		// !access:write=generated
 	atomic_int refcount;		// !access:read=none
+	bool attached;			// !access:read=none
 };
 
 struct libnvme_fabric_options { // !generate-accessors
@@ -437,6 +439,9 @@ struct libnvme_fabric_options { // !generate-accessors
 };
 
 struct libnvme_global_ctx { // !generate-accessors:read=none,write=none,prefix=libnvme !generate-python:alias=GlobalCtx
+	atomic_int refcount;
+	pthread_mutex_t topology_lock;
+	bool destroying;
 	/*
 	 * Orchestrator identity. Tri-state: NULL means --owner was never
 	 * given, "" means an explicit disown, and a name means a claim.
@@ -468,6 +473,8 @@ struct libnvme_global_ctx { // !generate-accessors:read=none,write=none,prefix=l
 	char *hostid;		// !access:read=none,write=generated
 };
 int libnvme_set_attr(const char *dir, const char *attr, const char *value);
+void __libnvme_global_ctx_ref(struct libnvme_global_ctx *ctx);
+void __libnvme_global_ctx_unref(struct libnvme_global_ctx *ctx);
 
 void *__libnvme_submit_entry(struct libnvme_transport_handle *hdl,
 		struct libnvme_passthru_cmd *cmd);
@@ -552,7 +559,6 @@ struct libnvme_ctrl *libnvme_ctrl_find(struct libnvme_subsystem *s,
 void libnvmf_read_sysfs_fabrics_attrs(struct libnvme_global_ctx *ctx,
 		struct libnvme_ctrl *c);
 
-void __libnvme_free_host(struct libnvme_host * h);
 
 #if (LOG_FUNCNAME == 1)
 #define __libnvme_log_func __func__

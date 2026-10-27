@@ -2040,7 +2040,8 @@ __shr_public int libnvmf_create_ctrl(struct libnvme_global_ctx *ctx,
 	return 0;
 }
 
-__shr_public int libnvmf_add_ctrl(struct libnvme_host *h, struct libnvme_ctrl *c)
+static int libnvmf_add_ctrl_locked(struct libnvme_host *h,
+		struct libnvme_ctrl *c)
 {
 	struct libnvme_subsystem *s;
 	__cleanup_free char *argstr = NULL;
@@ -2086,6 +2087,18 @@ __shr_public int libnvmf_add_ctrl(struct libnvme_host *h, struct libnvme_ctrl *c
 	libnvme_msg(h->ctx, LIBNVME_LOG_INFO, "nvme%d: %s connected\n", ret,
 		 libnvme_ctrl_get_subsysnqn(c));
 	return libnvme_init_ctrl(h, c, ret);
+}
+
+__shr_public int libnvmf_add_ctrl(struct libnvme_host *h,
+		struct libnvme_ctrl *c)
+{
+	int err;
+
+	libnvme_topology_lock(h->ctx);
+	err = h->attached ? libnvmf_add_ctrl_locked(h, c) : -ENODEV;
+	libnvme_topology_unlock(h->ctx);
+
+	return err;
 }
 
 __shr_public int libnvmf_connect_ctrl(struct libnvme_ctrl *c)

@@ -437,8 +437,7 @@ static bool test_host_ref_unref(void)
 /**
  * test_host_ref_survives_refresh_topology - a host with an outstanding
  * ref must not be freed by libnvme_refresh_topology()'s unconditional
- * free-every-host pass; it should only drop back to its pre-refresh
- * refcount (the reference taken here is released, not the tree's own).
+ * detach pass. The remaining reference belongs to the caller.
  */
 static bool test_host_ref_survives_refresh_topology(void)
 {
@@ -460,6 +459,9 @@ static bool test_host_ref_survives_refresh_topology(void)
 	libnvme_host_ref(h);
 
 	libnvme_refresh_topology(ctx);
+	shr_assert(libnvme_first_host(ctx) != h);
+	shr_assert(!libnvme_first_subsystem(h));
+	shr_assert(libnvme_host_get_global_ctx(h) == ctx);
 
 	if (h->refcount != 1) {
 		printf(" - survives refresh, got %d [FAIL]\n", h->refcount);
@@ -472,6 +474,75 @@ static bool test_host_ref_survives_refresh_topology(void)
 
 	libnvme_free_global_ctx(ctx);
 	return pass;
+}
+
+static bool test_host_outlives_context(void)
+{
+	struct libnvme_global_ctx *ctx = libnvme_create_global_ctx();
+	struct libnvme_host *h, *same;
+	struct libnvme_subsystem *s;
+
+	shr_assert(ctx);
+	shr_assert(!libnvme_get_host(ctx, HOSTNQN_1, HOSTID_1, &h));
+	shr_assert(!libnvme_get_host(ctx, HOSTNQN_1, HOSTID_1, &same));
+	shr_assert(h == same);
+	shr_assert(atomic_load(&h->refcount) == 1);
+	shr_assert(!libnvme_get_subsystem(ctx, h, NULL, SUBSYSNQN_1, &s));
+	libnvme_host_ref(h);
+	libnvme_free_global_ctx(ctx);
+	shr_assert(!strcmp(libnvme_host_get_hostnqn(h), HOSTNQN_1));
+	shr_assert(!libnvme_first_subsystem(h));
+	shr_assert(!libnvme_first_host(libnvme_host_get_global_ctx(h)));
+	libnvme_free_host(h);
+	shr_assert(atomic_load(&h->refcount) == 1);
+	libnvme_host_unref(h);
+
+	return true;
+}
+
+struct host_race {
+	struct libnvme_global_ctx *ctx;
+};
+
+static void *lookup_ref_thread(void *arg)
+{
+	struct host_race *race = arg;
+	struct libnvme_host *h;
+	int i;
+
+	for (i = 0; i < 2000; i++) {
+		libnvme_topology_lock(race->ctx);
+		shr_assert(!libnvme_get_host(race->ctx, HOSTNQN_1,
+					   HOSTID_1, &h));
+		libnvme_host_ref(h);
+		libnvme_topology_unlock(race->ctx);
+		shr_assert(!strcmp(libnvme_host_get_hostnqn(h), HOSTNQN_1));
+		libnvme_host_unref(h);
+	}
+
+	return NULL;
+}
+
+static bool test_lookup_ref_races_detach(void)
+{
+	struct host_race race = { .ctx = libnvme_create_global_ctx() };
+	struct libnvme_host *h;
+	pthread_t thread;
+	int i;
+
+	shr_assert(race.ctx);
+	shr_assert(!pthread_create(&thread, NULL, lookup_ref_thread, &race));
+	for (i = 0; i < 2000; i++) {
+		libnvme_topology_lock(race.ctx);
+		h = libnvme_first_host(race.ctx);
+		if (h)
+			libnvme_free_host(h);
+		libnvme_topology_unlock(race.ctx);
+	}
+	shr_assert(!pthread_join(thread, NULL));
+	libnvme_free_global_ctx(race.ctx);
+
+	return true;
 }
 
 /**
@@ -656,6 +727,11 @@ int main(int argc, char *argv[])
 {
 	bool pass = true;
 
+	if (argc == 2 && !strcmp(argv[1], "--ref-debug-enabled"))
+		return test_host_ref_debug_log_enabled() ? 0 : 1;
+	if (argc == 2 && !strcmp(argv[1], "--ref-debug-disabled"))
+		return test_host_ref_debug_log_disabled_by_default() ? 0 : 1;
+
 	pass &= test_host_dedup();
 	pass &= test_hostid_from_hostnqn();
 	pass &= test_host_attrs();
@@ -666,8 +742,8 @@ int main(int argc, char *argv[])
 	pass &= test_subsystem_iteration();
 	pass &= test_host_ref_unref();
 	pass &= test_host_ref_survives_refresh_topology();
-	pass &= test_host_ref_debug_log_disabled_by_default();
-	pass &= test_host_ref_debug_log_enabled();
+	pass &= test_host_outlives_context();
+	pass &= test_lookup_ref_races_detach();
 	pass &= test_host_ref_unref_is_thread_safe();
 
 	fflush(stdout);

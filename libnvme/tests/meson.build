@@ -162,6 +162,10 @@ tree = executable(
 )
 
 test('libnvme - tree', tree, suite: 'unit')
+test('libnvme - host-ref-debug-enabled', tree,
+     args: ['--ref-debug-enabled'], suite: 'unit')
+test('libnvme - host-ref-debug-disabled', tree,
+     args: ['--ref-debug-disabled'], suite: 'unit')
 
 if want_fabrics
     test_tid = executable(
