@@ -1,9 +1,16 @@
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 # libnvme 物件生命週期擴展提案
 
-日期：2026-10-29（Asia/Taipei）。狀態：設計草案，供討論與拆分實作。
-基準：`4438301365a1efe21e23bfcdbf3d39d3bc2203bb`，分支 `feature/host-refcount`。
+日期：2026-10-29（Asia/Taipei），2026-11-19 核對更新。狀態：設計草案，供討論與拆分實作。
+基準：`354b9f6f38dc`，分支 `feature/host-refcount`（PR #4129）。
 本報告提出後續方案，不表示以下 API、狀態或測試已實作完成。
+
+**2026-11-19 更新**：PR #4129 review 的 point 1（host 的 use-after-free）與
+point 5（topology lookup 與最後一次 unref 之間的 race）已實作並併入
+`feature/host-refcount`（commit `354b9f6f3`）。範圍限定在 host 一個物件；
+locking 只涵蓋 `ctx->hosts`，不包含 subsystem/controller/namespace 的清單。
+本次更新同步修正了第 2 節現況表格與第 3 節 checkpoint 清單對應的項目，
+其餘章節（第 4 節起的擴展設計）維持原提案內容，尚未實作。
 
 ## 1. 目標與建議順序
 
@@ -31,7 +38,7 @@ controller、namespace、transport handle、path 與 NVMe-MI endpoint，
 
 | 區域 | 現況與影響 |
 | --- | --- |
-| `libnvme/src/nvme/private.h` | host 有 atomic refcount、attached；context 有內部 refcount、topology mutex、destroying。其他物件仍有未受保護的 parent 指標。 |
+| `libnvme/src/nvme/private.h` | host 有 atomic refcount、attached；context 有內部 refcount、topology mutex、destroying（已實作，見下方更新）。`topology_lock` 目前只保護 `ctx->hosts`；subsystem/controller/namespace 仍是未受保護的 parent 指標。`libnvme_host_get_global_ctx()` 在 detach 後回傳 NULL（`h->ctx` 本身不清空），與本提案原先假設的「`h->ctx` 永遠有效」不同。 |
 | `libnvme/src/nvme/tree.c` | subsystem/controller/namespace 的 destructor 仍直接遞迴釋放子項目；需逐項改為 detach/dispose 與 reference release。 |
 | `libnvme/src/nvme/lib.c` | host 已保留 context；MI endpoints 目前仍在 context 最終釋放時清除。加入 endpoint→context reference 後必須改動此順序。 |
 | `libnvme/src/nvme/tree.c` | controller 可獨立存在；`libnvme_unlink_ctrl()` 會清除 `c->s`，不能把目前掛接位置直接當成永久 parent reference。 |
@@ -52,13 +59,19 @@ controller、namespace、transport handle、path 與 NVMe-MI endpoint，
 以下四項先完成，作為擴展其他物件前的驗收門檻：
 
 1. 補齊 Python scan、refresh、Subsystem 等入口等待 topology mutex 時的
-   GIL 處理；不只修直接呼叫 lock 或 Host constructor 的路徑。
+   GIL 處理；不只修直接呼叫 lock 或 Host constructor 的路徑。**尚未實作**：
+   目前 `libnvme_topology_lock()`/`unlock()` 只在 C 層使用，沒有透過
+   Python bindings 暴露、也沒有釋放 GIL，所以這個死結風險目前還不會
+   實際發生；一旦之後把鎖暴露給 Python 就要補上。
 2. detached host 建立 subsystem 的 `-ENODEV` 必須在建構時轉成 Python
-   例外，不得產生 `this=None` 的無效 proxy。
+   例外，不得產生 `this=None` 的無效 proxy。**部分完成**：C 層的
+   `libnvme_create_subsystem()`/`libnvme_get_subsystem()` 已對 detached
+   host 回傳 `-ENODEV`；Python 這邊的 Subsystem constructor 還沒有把
+   這個錯誤轉成例外，仍待補上。
 3. 驗證參數 `ctx` 與物件所屬 context 一致；不得鎖住另一個 context
-   卻修改目前物件。跨 context 掛接原則上回傳 `-EINVAL`。
+   卻修改目前物件。跨 context 掛接原則上回傳 `-EINVAL`。**尚未實作**。
 4. 更正 context-wrapper 測試的語意，使用 weakref 證明 Python wrapper
-   是否真的被回收；C owner teardown 由獨立 C 測試驗證。
+   是否真的被回收；C owner teardown 由獨立 C 測試驗證。**尚未實作**。
 
 每項必須有修正前失敗、修正後成功的測試。既有 suite 通過不能替代這些案例。
 
@@ -277,7 +290,10 @@ atomic 計數不取代上述鎖。refcount 初值、最後一次釋放、禁止�
 
 公開 API 優先保持既有簽章與 borrowed 語意；必要的 owned 介面採新增方式。
 `_at()` 或雙底線 backing symbol、public lock 與新版本節點須由上游定案。
-checkpoint 的 `LIBNVME_3.1` 是目前草案選擇，不當作已接受的發布政策。
+checkpoint 原本選擇把新 symbol 獨立放進 `LIBNVME_3.1` 版本節點；目前併入
+`feature/host-refcount` 的版本改成直接加進既有的 `LIBNVME_3`，沒有另開
+版本節點。兩種做法哪個才是上游要的 ABI 慣例，仍待確認，不當作已接受的
+發布政策。
 
 opaque struct 可新增 private 狀態；所有 accessor/bindings 產生檔由產生器更新。
 計數器、鎖、owner/state 等管理欄位不自動匯出成公開 setter。
@@ -294,7 +310,7 @@ ref/unref 診斷沿用獨立開關，記錄物件類別、穩定的實例識別�
 
 | 階段 | 交付內容 | 驗收門檻 |
 | --- | --- | --- |
-| 0 | 修正第 3 節四項 checkpoint 問題 | 每項 failing-first 測試；現有 host suite 與 GIL 逾時案例通過。 |
+| 0 | 修正第 3 節四項 checkpoint 問題（注意：這 4 項跟 PR #4129 review 的 point 1/5 是不同的問題，point 1/5 已修好併入 `feature/host-refcount`，第 3 節這 4 項仍待處理） | 每項 failing-first 測試；現有 host suite 與 GIL 逾時案例通過。 |
 | 1 | API ownership 表、context dispose、共用 ref/state 規則 | 確認 owner 移交及循環拆解；逐個錯誤分支無洩漏；不增加不必要公開框架。 |
 | 2 | Subsystem、Ctrl、Namespace 與既有 Python 類別 | parent 先 dispose、任意 wrapper 釋放順序、unlink/reparent、refresh 後舊物件安全。 |
 | 3 | Path、namespace head 索引與 multipath | 兩種移除順序、controller 刪除、namespace 替換、重掃無重複索引或 stale pointer。 |
@@ -345,6 +361,8 @@ pending I/O、callback 與舊 C API 相容性若需要新增 adapter，範圍可
 2. 每個既有 factory/free/close 的 owner 與移交表是否符合原有 C 使用者？
 3. detached 物件允許哪些 getter、重新掛接及資源操作？
 4. topology lock 是否公開，還是以 owned lookup/iterator 隱藏同步細節？
+   host 範圍已選擇公開（`libnvme_topology_lock()`/`unlock()`，recursive
+   mutex）；擴展到其他物件時是否沿用同一把鎖或同一個決定，仍待確認。
 5. backing symbol 命名與 ABI version node 政策。
 6. pending I/O 與 callback 內 close 的完成／延後關閉契約。
 7. MI endpoint/handle 的 Python 公開類別是否與 C 生命週期擴展同批發布？
@@ -367,7 +385,7 @@ pending I/O、callback 與舊 C API 相容性若需要新增 adapter，範圍可
 | 資源 close | GInputStream close 使 stream 關閉，不交還 caller reference；可再 unref。 | libnvme_close 關資源並 free handle，沒有可保留的 CLOSED handle。 | 新介面分離 close 與 unref，舊 API 用相容入口處理；明確禁止在保留 reference 時繼續使用 closed 資源。 |
 | 循環 | 普通 refcount 不會自行消除強 reference cycle；run_dispose 可供物件系統拆循環。 | host 與 context 依賴 free_global_ctx 顯式拆 hosts 清單。 | 優先減少不必要的雙向強關係；必要循環逐一列出 shutdown 起點。不要把 run_dispose 當作一般呼叫者的萬用修復。 |
 | Weak reference | GWeakRef 能同步地將仍有效的弱關係升級為強 reference。 | path→namespace 等 raw pointer 沒有這類通用機制；目前仍靠清單清除。 | 弱指標在同一把鎖下查找、ref 與失效；不在解鎖後對 raw pointer 直接 ref。 |
-| 執行緒安全 | GLib 明確區分 refcount 的執行緒安全與容器內容的同步。 | 部分 topology 操作有鎖，但範圍不完整，Python 仍有已知 GIL 死鎖。 | refcount helper 不包辦欄位鎖；補齊入口、鎖順序與 blocking operation 的分段設計。 |
+| 執行緒安全 | GLib 明確區分 refcount 的執行緒安全與容器內容的同步。 | host 的 topology 操作已有鎖（recursive mutex），但範圍不含 subsystem/controller/namespace；鎖未暴露給 Python、也沒有搭配 GIL 釋放，所以暫無死鎖，但之後要暴露時必須補上。 | refcount helper 不包辦欄位鎖；補齊入口、鎖順序與 blocking operation 的分段設計。 |
 | Bindings | transfer none/full 等註記明確表達是否移交一份 reference。 | SWIG 使用個別 constructor、destructor、newobject 與 parent 屬性處理。 | 為各回傳路徑建立一致的 borrowed/owned 表格，再映射到 SWIG；不讓 Python parent 屬性代替 C 所有權。 |
 
 資料來源：
